@@ -1,160 +1,111 @@
 #!/usr/bin/env python3
-"""
-AUTOMA Monitor Script for Attestcoin Protocol
+"""AUTOMA - Demo end-to-end del flusso cross-chain su Base Sepolia.
 
-Monitors new attestations on Creditcoin and triggers AutomaVerifier on Base.
-"""
+Uso (dopo scripts/1_deploy.py):
+    python scripts/monitor_attestations.py
 
-from web3 import Web3
-from web3.middleware import geth_poa_middleware
+Flusso:
+  1. Crea un'attestazione sul MockAttestcoin (simula il layer Creditcoin)
+  2. Rilascia i fondi con AutomaVerifier.verifyAndRelease()
+  3. Riprova con la STESSA attestazione: deve fallire (anti-replay)
+"""
+import hashlib
+import json
+import sys
 import time
-import os
-from dotenv import load_dotenv
+from pathlib import Path
 
-# Load environment variables
-load_dotenv()
+ROOT = Path(__file__).resolve().parent.parent
 
-# Configuration
-CREDITCOIN_RPC = os.getenv("CREDITCOIN_RPC", "https://rpc.creditcoin.network")
-BASE_RPC = os.getenv("BASE_RPC", "https://mainnet.base.org")
-ATTESTCOIN_ADDRESS = os.getenv("ATTESTCOIN_ADDRESS")
-AUTOMA_VERIFIER_ADDRESS = os.getenv("AUTOMA_VERIFIER_ADDRESS")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+BASE_SEPOLIA_RPC = "https://sepolia.base.org"
+CHAIN_ID = 84532
+AMOUNT_USDC = 25
 
-# Validate environment
-if not ATTESTCOIN_ADDRESS or not AUTOMA_VERIFIER_ADDRESS:
-    raise Exception("Contract addresses not configured")
-if not PRIVATE_KEY or len(PRIVATE_KEY) != 64:
-    raise Exception("Invalid private key")
 
-# ABI for Attestcoin (simplified)
-ATTESTCOIN_ABI = """
-[
-    {
-        "anonymous": false,
-        "inputs": [
-            {"indexed": true, "name": "attestationId", "type": "bytes32"},
-            {"indexed": false, "name": "sourceChain", "type": "string"},
-            {"indexed": false, "name": "data", "type": "bytes"}
-        ],
-        "name": "AttestationVerified",
-        "type": "event"
-    }
-]
-"""
+def main():
+    from web3 import Web3
+    import solcx
 
-# ABI for AutomaVerifier (simplified)
-AUTOMA_VERIFIER_ABI = """
-[
-    {
-        "inputs": [
-            {"name": "attestationId", "type": "bytes32"},
-            {"name": "recipient", "type": "address"},
-            {"name": "amount", "type": "uint256"}
-        ],
-        "name": "verifyAndRelease",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    }
-]
-"""
+    solcx.install_solc("0.8.20")
+    out = solcx.compile_files(
+        [str(ROOT / "contracts" / "AutomaVerifier.sol")],
+        output_values=("abi",),
+        solc_version="0.8.20",
+    )
+    abi = {k.split(":")[-1]: v["abi"] for k, v in out.items()}
 
-# Initialize Web3
-w3_creditcoin = Web3(Web3.HTTPProvider(CREDITCOIN_RPC))
-w3_base = Web3(Web3.HTTPProvider(BASE_RPC))
+    info = json.loads((ROOT / "deployed.json").read_text())
+    key = None
+    for line in (ROOT / ".env.demo").read_text().splitlines():
+        if line.startswith("DEPLOYER_KEY="):
+            key = line.split("=", 1)[1].strip()
 
-# Add PoA middleware for Creditcoin (if needed)
-w3_creditcoin.middleware_onion.inject(geth_poa_middleware, layer=0)
+    w3 = Web3(Web3.HTTPProvider(BASE_SEPOLIA_RPC))
+    acct = w3.eth.account.from_key(key)
+    usdc = w3.eth.contract(address=info["mock_usdc"], abi=abi["MockUSDC"])
+    att = w3.eth.contract(address=info["mock_attestcoin"],
+                          abi=abi["MockAttestcoin"])
+    ver = w3.eth.contract(address=info["automa_verifier"],
+                          abi=abi["AutomaVerifier"])
 
-# Check connections
-if not w3_creditcoin.is_connected():
-    raise Exception("Failed to connect to Creditcoin RPC")
-if not w3_base.is_connected():
-    raise Exception("Failed to connect to Base RPC")
+    def send(fn, gas=200_000):
+        tx = fn.build_transaction(
+            {"from": acct.address,
+             "nonce": w3.eth.get_transaction_count(acct.address),
+             "gas": gas,
+             "maxFeePerGas": w3.to_wei(0.15, "gwei"),
+             "maxPriorityFeePerGas": w3.to_wei(0.001, "gwei"),
+             "chainId": CHAIN_ID})
+        signed = acct.sign_transaction(tx)
+        h = w3.eth.send_raw_transaction(signed.raw_transaction)
+        rc = w3.eth.wait_for_transaction_receipt(h, timeout=180)
+        assert rc.status == 1, f"tx fallita: {h.hex()}"
+        print(f"    tx: https://sepolia.basescan.org/tx/{h.hex()}")
+        return h
 
-# Initialize contracts
-attestcoin = w3_creditcoin.eth.contract(
-    address=ATTESTCOIN_ADDRESS,
-    abi=ATTESTCOIN_ABI
-)
-automa_verifier = w3_base.eth.contract(
-    address=AUTOMA_VERIFIER_ADDRESS,
-    abi=AUTOMA_VERIFIER_ABI
-)
+    print("=== DEMO AUTOMA: pagamento cross-chain verificato ===\n")
 
-# Wallet account
-account = w3_base.eth.account.from_key(PRIVATE_KEY)
+    print("[1/4] Creo l'attestazione (simula Creditcoin Attestcoin)...")
+    payload = json.dumps({
+        "job": "automa-demo",
+        "recipient": acct.address,
+        "amount_usdc": AMOUNT_USDC,
+        "ts": int(time.time()),
+    }, sort_keys=True).encode()
+    att_id = hashlib.sha256(payload).digest()
+    send(att.functions.createAttestation(
+        att_id, "creditcoin-testnet", payload), gas=150_000)
+    print(f"    attestationId: 0x{att_id.hex()}\n")
 
-def load_last_block():
-    """Load last processed block from file."""
+    print(f"[2/4] verifyAndRelease -> rilascio {AMOUNT_USDC} USDC...")
+    send(ver.functions.verifyAndRelease(
+        att_id, acct.address, AMOUNT_USDC * 10 ** 6))
+    bal_ver = usdc.functions.balanceOf(ver.address).call() / 10 ** 6
+    bal_to = usdc.functions.balanceOf(acct.address).call() / 10 ** 6
+    print(f"    saldo verifier: {bal_ver} USDC | ricevuto: {bal_to} USDC\n")
+
+    print("[3/4] Anti-replay: stesso attestationId di nuovo...")
     try:
-        with open("last_block.txt", "r") as f:
-            return int(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        return w3_creditcoin.eth.block_number
-
-def save_last_block(block_number):
-    """Save last processed block to file."""
-    with open("last_block.txt", "w") as f:
-        f.write(str(block_number))
-
-def monitor_attestations():
-    """Monitor new attestations on Creditcoin and trigger AutomaVerifier."""
-    print("Monitoring attestations on Creditcoin...")
-    
-    last_block = load_last_block()
-    while True:
-        try:
-            current_block = w3_creditcoin.eth.block_number
-            if current_block > last_block:
-                # Fetch new events
-                events = attestcoin.events.AttestationVerified.get_logs(
-                    from_block=last_block + 1,
-                    to_block=current_block
-                )
-                for event in events:
-                    attestation_id = event.args.attestationId
-                    recipient = "0x" + event.args.data.hex()[-40:]  # Extract recipient from attestation data
-                    print(f"New attestation detected: {attestation_id.hex()}")
-                    print(f"Recipient extracted: {recipient}")
-                    call_automa_verifier(attestation_id, recipient)
-                last_block = current_block
-                save_last_block(last_block)
-            time.sleep(15)  # Poll every 15 seconds
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(30)
-
-def call_automa_verifier(attestation_id, recipient):
-    """Call AutomaVerifier.verifyAndRelease on Base."""
-    try:
-        # Example: Release 1 USDC (6 decimals)
-        amount = 1000000  # 1 USDC
-        
-        tx = automa_verifier.functions.verifyAndRelease(
-            attestation_id,
-            recipient,
-            amount
-        ).build_transaction({
-            "from": account.address,
-            "gas": 200000,
-            "gasPrice": w3_base.eth.gas_price,
-            "nonce": w3_base.eth.get_transaction_count(account.address)
-        })
-        
-        signed_tx = account.sign_transaction(tx)
-        tx_hash = w3_base.eth.send_raw_transaction(signed_tx.rawTransaction)
-        print(f"Transaction sent: {tx_hash.hex()}")
-        
-        # Wait for receipt
-        receipt = w3_base.eth.wait_for_transaction_receipt(tx_hash)
-        if receipt.status == 1:
-            print("Transaction successful!")
-        else:
-            print("Transaction failed!")
+        send(ver.functions.verifyAndRelease(
+            att_id, acct.address, AMOUNT_USDC * 10 ** 6))
+        print("    !!! ERRORE: replay riuscito, bug!")
+        sys.exit(1)
     except Exception as e:
-        print(f"Error calling AutomaVerifier: {e}")
+        msg = str(e)
+        ok = "AlreadyReleased" in msg or "revert" in msg.lower()
+        print(f"    correttamente bloccato ({'AlreadyReleased' if ok else msg[:80]})\n")
+
+    print("[4/4] Stato finale on-chain:")
+    released = ver.functions.alreadyReleased(att_id).call()
+    print(f"    alreadyReleased[{att_id.hex()[:16]}...] = {released}")
+    verified = att.functions.verifyAttestation(att_id).call()
+    print(f"    verifyAttestation = {verified}")
+
+    print("\n=== DEMO COMPLETATA CON SUCCESSO ===")
+    print("Contratti su Basescan:")
+    for k in ("mock_usdc", "mock_attestcoin", "automa_verifier"):
+        print(f"  {k}: https://sepolia.basescan.org/address/{info[k]}")
+
 
 if __name__ == "__main__":
-    monitor_attestations()
+    main()

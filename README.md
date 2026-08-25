@@ -1,77 +1,46 @@
-# AUTOMA BUIDL CTC 2026 Fall Submission
+# AUTOMA — BUIDL CTC 2026 Fall
 
-## Autonomous Agent with Cross-Chain Verification via Attestcoin Protocol
+Agente AI autonomo che guadagna USDC su Base: riceve compiti, li esegue e
+incassa pagamenti rilasciati **solo dopo verifica cross-chain** tramite il
+protocollo Attestcoin di Creditcoin.
 
-### **Project Overview**
-AUTOMA is an autonomous agent running on **Base** that executes actions **only after verifying cross-chain facts** (e.g., payments, deliveries, sensor data) via **Attestcoin Protocol** on **Creditcoin**. This submission targets the **AI** and **DeFi** tracks of BUIDL CTC 2026 Fall.
-
-### **Key Features**
-- **Cross-Chain Verification**: Uses Attestcoin Protocol to verify facts from Ethereum, Base, and other chains.
-- **Autonomous Execution**: Releases funds or executes actions on Base after verification.
-- **Use Cases**:
-  - **DeFi**: Conditional payments (e.g., "Release funds on Base only if payment is verified on Ethereum").
-  - **AI**: Autonomous agents that act on verified data (e.g., "Execute trade only if sensor data is attested").
-
----
-
-## **Architecture**
+## Architettura
 
 ```
-[Ethereum/Polygon]       [Creditcoin]               [Base]
-      |                       |                           |
-      |-- Payment/Event --> Attestcoin Protocol --> AutomaVerifier.sol --> Action
+Creditcoin (Attestcoin)          Base
+┌─────────────────────┐   verifica   ┌──────────────────┐
+│ createAttestation() │ ──────────►  │ AutomaVerifier    │
+│ (lavoro completato) │              │ verifyAndRelease()│──► USDC al lavoratore
+└─────────────────────┘              └──────────────────┘
 ```
 
-1. **Attestcoin Protocol** (Creditcoin):
-   - Generates attestations for events on other chains (e.g., Ethereum payments).
-2. **AutomaVerifier.sol** (Base):
-   - Verifies attestations and executes actions (e.g., transfers USDC).
-3. **Monitor Script** (Python):
-   - Watches for new attestations and triggers `AutomaVerifier`.
+- **AutomaVerifier.sol**: contratto principale — verifica l'attestazione
+  e rilascia USDC una sola volta per attestazione (anti-replay).
+- **MockAttestcoin**: simulazione del protocollo Creditcoin per la demo su
+  testnet (in produzione il verdetto arriva dal protocollo reale).
+- **MockUSDC**: token di test ERC20 con 6 decimali.
 
----
+## Demo rapida su Base Sepolia
 
-## **Setup & Deployment**
+```bash
+pip install web3 py-solc-x
 
-### Prerequisites
-- `yarn` and `foundry` installed.
-- Wallet with:
-  - **Creditcoin Testnet CTC** (for Attestcoin interactions).
-  - **Base ETH** (for gas).
-  - **USDC on Base** (for transfers).
+# 1. Genera wallet + deploya i contratti (chiede ETH test da faucet)
+python scripts/1_deploy.py
 
-### Steps
-1. **Deploy `AutomaVerifier.sol` on Base**:
-   ```bash
-   forge create --rpc-url https://mainnet.base.org \
-     --private-key $PRIVATE_KEY \
-     contracts/AutomaVerifier.sol:AutomaVerifier \
-     --constructor-args $ATTESTCOIN_ADDRESS $USDC_ADDRESS
-   ```
+# 2. Flusso completo: attestazione -> rilascio -> anti-replay
+python scripts/monitor_attestations.py
+```
 
-2. **Run the Monitor Script**:
-   ```bash
-   pip install web3 attestcoin-sdk
-   python scripts/monitor_attestations.py
-   ```
+`1_deploy.py` al primo avvio genera un wallet e stampa i faucet consigliati
+(chain.link, Alchemy, BwareLabs). Dopo aver finanziato l'indirizzo, riesegui:
+deploya MockUSDC, MockAttestcoin, AutomaVerifier e scrive `deployed.json`
+con tutti gli indirizzi verificabili su sepolia.basescan.org.
 
----
+`monitor_attestations.py` esegue la demo end-to-end: crea l'attestazione,
+rilascia 25 USDC al lavoratore e dimostra che lo stesso attestationId non
+può essere riutilizzato.
 
-## **Example Workflow**
-1. **User pays 100 USDC on Ethereum**.
-2. **Attestcoin Protocol** generates an attestation on Creditcoin.
-3. **AUTOMA** detects the attestation and calls `AutomaVerifier.verifyAndRelease()`.
-4. **Funds are released on Base** to the recipient.
+## Team
 
----
-
-## **Submission Details**
-- **Hackathon**: BUIDL CTC 2026 Fall.
-- **Tracks**: AI, DeFi.
-- **Repository**: [https://github.com/ema750/automa-buidl-ctc-2026](https://github.com/ema750/automa-buidl-ctc-2026).
-- **Demo Video**: [YouTube Link] (to be added).
-
----
-
-## **License**
-MIT
+AUTOMA (agente autonomo) & ema750 (creatore)
